@@ -45,6 +45,8 @@ QUALITY_FORMATS = {
     "720p": "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
     "480p": "bv*[height<=480]+ba/b[height<=480]/bv*+ba/b",
 }
+BILIBILI_SITES = ("bilibili.com", "b23.tv")
+OUTPUT_NAME_TEMPLATE = "%(title).160B [%(id)s].%(ext)s"
 KNOWN_PLATFORMS = {
     "youtube.com": "YouTube", "youtu.be": "YouTube", "bilibili.com": "Bilibili",
     "b23.tv": "Bilibili", "x.com": "X", "twitter.com": "X", "vimeo.com": "Vimeo",
@@ -89,10 +91,11 @@ def terminate_process_tree(process: subprocess.Popen[str]) -> None:
 
 
 def run_command(args: list[str], stage: str, timeout: int, *, stream: bool = False,
-                pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
+                pass_fds: tuple[int, ...] = (), cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
     if stream and os.name == "posix":
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, bufsize=1, start_new_session=True, pass_fds=pass_fds)
+                                   text=True, bufsize=1, start_new_session=True, pass_fds=pass_fds,
+                                   cwd=str(cwd) if cwd else None)
         if process.stdout is None:
             raise SkillError(stage, "could not capture command output")
         output: deque[str] = deque(maxlen=500)
@@ -123,7 +126,8 @@ def run_command(args: list[str], stage: str, timeout: int, *, stream: bool = Fal
         completed = subprocess.CompletedProcess(args, process.returncode, "".join(output), "")
     else:
         try:
-            completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
+            completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout,
+                                       cwd=str(cwd) if cwd else None)
         except subprocess.TimeoutExpired as exc:
             raise SkillError(stage, f"command timed out after {timeout}s") from exc
     if completed.returncode != 0:
@@ -221,6 +225,19 @@ def cookie_args(browser: str | None) -> list[str]:
     return ["--cookies-from-browser", browser] if browser else []
 
 
+def platform_request_args(url: str) -> list[str]:
+    """Per-site header fixes.
+
+    Bilibili's WAF answers 412 Precondition Failed to api.bilibili.com/x/player/wbi/playurl
+    when the request carries Referer + Cookie but no Origin header (yt-dlp always sends the
+    Referer from BiliBiliIE._HEADERS). Sending the Origin a browser would send fixes it.
+    """
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if any(host == site or host.endswith(f".{site}") for site in BILIBILI_SITES):
+        return ["--add-header", "Origin:https://www.bilibili.com"]
+    return []
+
+
 def ffmpeg_args() -> list[str]:
     override = os.environ.get("QIAOMU_FFMPEG_BIN")
     return ["--ffmpeg-location", str(Path(override).expanduser())] if override else []
@@ -316,7 +333,7 @@ def doctor(upgrade: bool, timeout: int) -> dict[str, Any]:
 
 def load_metadata_once(url: str, browser: str | None, timeout: int) -> dict[str, Any]:
     command = [require_tool("yt-dlp"), "--dump-single-json", "--skip-download", "--no-playlist",
-               "--no-warnings", *cookie_args(browser), url]
+               "--no-warnings", *cookie_args(browser), *platform_request_args(url), url]
     result = run_command(command, "metadata", timeout)
     try:
         payload = json.loads(result.stdout)
@@ -351,7 +368,18 @@ def metadata_summary(payload: dict[str, Any], source_url: str) -> dict[str, Any]
 
 
 def output_template(output_dir: Path) -> str:
-    return str(output_dir / "%(title).160B [%(id)s].%(ext)s")
+    return str(output_dir / OUTPUT_NAME_TEMPLATE)
+
+
+def download_command_cwd(output_dir: Path) -> Path:
+    """yt-dlp prefixes every ffmpeg input with 'file:'.
+
+    Some ffmpeg builds (e.g. the Alpine/iSH build on iOS) cannot open
+    'file:/absolute/path' and fail postprocessing with "Error opening input".
+    Running yt-dlp inside the output directory with a relative -o template keeps
+    every path relative, which those builds handle correctly.
+    """
+    return output_dir
 
 
 def prepare_output_dir(value: str | None) -> Path:
@@ -440,11 +468,12 @@ def download_media(url: str, output_dir: Path, quality: str, cookie_mode: str,
         before = {p.resolve() for p in matching_files(output_dir, media_id, suffixes)}
         before_artifacts = {p.resolve() for p in all_media_files(output_dir, media_id)}
         command = [yt_dlp, "--no-playlist", "--no-overwrites", "--newline",
-                   *ffmpeg_args(), *cookie_args(browser)]
+                   *ffmpeg_args(), *cookie_args(browser), *platform_request_args(url)]
         command += (["-x", "--audio-format", "mp3", "--audio-quality", "0"] if audio_only else
                     ["-f", QUALITY_FORMATS[quality], "--merge-output-format", "mp4"])
-        command += ["-o", output_template(output_dir), url]
-        run_command(command, "download", timeout, stream=True, pass_fds=(lock.fileno(),))
+        command += ["-o", OUTPUT_NAME_TEMPLATE, url]
+        run_command(command, "download", timeout, stream=True, pass_fds=(lock.fileno(),),
+                    cwd=download_command_cwd(output_dir))
         files = matching_files(output_dir, media_id, suffixes)
         if not files:
             raise SkillError("download", "yt-dlp finished but no final media file was found")
@@ -464,8 +493,9 @@ def download_subtitles(url: str, output_dir: Path, langs: str, cookie_mode: str,
         command = [require_tool("yt-dlp"), "--no-playlist", "--no-overwrites", *ffmpeg_args(),
                    "--write-subs", "--write-auto-subs",
                    "--sub-langs", langs, "--convert-subs", "srt", "--skip-download", *cookie_args(browser),
-                   "-o", output_template(output_dir), url]
-        run_command(command, "download", timeout, stream=True, pass_fds=(lock.fileno(),))
+                   *platform_request_args(url), "-o", OUTPUT_NAME_TEMPLATE, url]
+        run_command(command, "download", timeout, stream=True, pass_fds=(lock.fileno(),),
+                    cwd=download_command_cwd(output_dir))
     files = matching_files(output_dir, media_id, SUBTITLE_SUFFIXES)
     if not files:
         raise SkillError("download", "no requested subtitles were available")
